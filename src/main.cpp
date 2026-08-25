@@ -2,187 +2,188 @@
 #include <ESP32Servo.h>
 #include <DHT.h>
 
-#define BOTAO 18
-#define SERVO_PIN 13
-#define DHT_PIN 4
-#define DHT_TYPE DHT11
+// Definicao dos pinos de conexao dos componentes
+#define PINO_BOTAO 18
+#define PINO_SERVO 13
+#define PINO_DHT 4
+#define TIPO_SENSOR_DHT DHT11
 
-// Configuracao dos limites e velocidade do movimento do servo
-const int ANGULO_ESQUERDA = 20;
-const int ANGULO_DIREITA = 160;
-const unsigned long TEMPO_DO_CURSO = 600;
+// Configuracao dos limites e velocidade de movimento da palheta
+const int ANGULO_ESQUERDA_REPOUSO = 20;
+const int ANGULO_DIREITA_MAXIMO = 160;
+const unsigned long TEMPO_CURSO_PALHETA_MS = 600;
 
-// Tempo usado para evitar que um clique seja detectado varias vezes
-const unsigned long TEMPO_DEBOUNCE = 50;
+// Tempo de filtro (debounce) para ignorar ruidos eletricos no clique do botao
+const unsigned long TEMPO_DEBOUNCE_BOTAO_MS = 50;
 
-// Configuracao dos limites de umidade e intervalo de leitura do DHT11
-const float UMIDADE_PARA_LIGAR = 20.0;
-const float UMIDADE_PARA_DESLIGAR = 0;
-const unsigned long INTERVALO_LEITURA_DHT = 2000;
+// Limites de umidade e intervalo entre leituras do sensor DHT11
+const float LIMIAR_UMIDADE_LIGAR = 20.0;
+const float LIMIAR_UMIDADE_DESLIGAR = 0.0;
+const unsigned long INTERVALO_LEITURA_DHT_MS = 2000;
 
-// Criacao dos objetos responsaveis pelo servo e pelo DHT11
-Servo servo;
-DHT dht(DHT_PIN, DHT_TYPE);
+// Criacao dos objetos de controle do servo motor e do sensor DHT
+Servo servoLimpador;
+DHT sensorDht(PINO_DHT, TIPO_SENSOR_DHT);
 
-// Variaveis que guardam o estado atual do sistema
-bool ligado = false;
-bool ligadoPeloBotao = false;
-bool ligadoPeloSensor = false;
+// Variaveis de estado do sistema
+bool limpadorAtivo = false;
+bool ativadoManualmente = false;
+bool ativadoPorSensor = false;
 bool sensorAutomaticoBloqueado = false;
 
-// Guarda o destino atual do servo e quando o movimento começou
-int destinoServo = ANGULO_ESQUERDA;
-unsigned long inicioDoCurso = 0;
+// Variaveis de controle do movimento do servo
+int anguloDestinoServo = ANGULO_ESQUERDA_REPOUSO;
+unsigned long tempoInicioMovimentoMs = 0;
 
-// Variaveis usadas para controlar corretamente o clique do botao
-int ultimaLeituraBotao = HIGH;
-int estadoEstavelBotao = HIGH;
-unsigned long inicioDoDebounce = 0;
+// Variaveis de leitura e filtro do botao
+int ultimaLeituraPinoBotao = HIGH;
+int estadoConfirmadoBotao = HIGH;
+unsigned long tempoInicioDebounceMs = 0;
 
-// Guarda quando foi feita a ultima leitura do DHT11
-unsigned long ultimaLeituraDht = 0;
+// Variavel de temporizacao da leitura do sensor DHT
+unsigned long tempoUltimaLeituraDhtMs = 0;
 
 
-// Liga ou desliga o limpador e movimenta o servo para a posicao correta
+// Liga ou desliga o limpador e posiciona o servo motor
 void definirEstadoLimpador(bool novoEstado, const char *origem) {
-    if (novoEstado == ligado) {
+    if (novoEstado == limpadorAtivo) {
         return;
     }
 
-    ligado = novoEstado;
+    limpadorAtivo = novoEstado;
 
     Serial.print("Limpador: ");
-    Serial.print(ligado ? "LIGADO" : "DESLIGADO");
+    Serial.print(limpadorAtivo ? "LIGADO" : "DESLIGADO");
     Serial.print(" (");
     Serial.print(origem);
     Serial.println(")");
 
-    if (ligado) {
-        destinoServo = ANGULO_DIREITA;
-        servo.write(destinoServo);
-        inicioDoCurso = millis();
+    if (limpadorAtivo) {
+        anguloDestinoServo = ANGULO_DIREITA_MAXIMO;
+        servoLimpador.write(anguloDestinoServo);
+        tempoInicioMovimentoMs = millis();
     } else {
-        destinoServo = ANGULO_ESQUERDA;
-        servo.write(destinoServo);
+        anguloDestinoServo = ANGULO_ESQUERDA_REPOUSO;
+        servoLimpador.write(anguloDestinoServo);
     }
 }
 
 
-// Verifica se o limpador deve ficar ligado pelo botao ou pelo sensor
+// Verifica se o limpador deve ficar ligado pelo botao OU pelo sensor
 void atualizarEstadoLimpador(const char *origem) {
     definirEstadoLimpador(
-        ligadoPeloBotao || ligadoPeloSensor,
+        ativadoManualmente || ativadoPorSensor,
         origem
     );
 }
 
 
-// Alterna o limpador entre ligado e desligado quando o botao e pressionado
+// Alterna entre ligar ou desligar quando o botao fisico e pressionado
 void alternarLimpadorPeloBotao() {
-    if (ligado) {
-        ligadoPeloBotao = false;
-        ligadoPeloSensor = false;
-        sensorAutomaticoBloqueado = true;
+    if (limpadorAtivo) {
+        ativadoManualmente = false;
+        ativadoPorSensor = false;
+        sensorAutomaticoBloqueado = true; // Bloqueia religamento automatico imediato
     } else {
-        ligadoPeloBotao = true;
+        ativadoManualmente = true;
     }
 
     atualizarEstadoLimpador("botao");
 }
 
 
-// Le o botao e aplica debounce para considerar apenas um clique por toque
+// Le o pino do botao e filtra ruidos (debounce) para detectar um clique valido
 void atualizarBotao() {
-    int leitura = digitalRead(BOTAO);
+    int leituraAtual = digitalRead(PINO_BOTAO);
 
-    if (leitura != ultimaLeituraBotao) {
-        inicioDoDebounce = millis();
-        ultimaLeituraBotao = leitura;
+    if (leituraAtual != ultimaLeituraPinoBotao) {
+        tempoInicioDebounceMs = millis();
+        ultimaLeituraPinoBotao = leituraAtual;
     }
 
     if (
-        millis() - inicioDoDebounce >= TEMPO_DEBOUNCE &&
-        leitura != estadoEstavelBotao
+        millis() - tempoInicioDebounceMs >= TEMPO_DEBOUNCE_BOTAO_MS &&
+        leituraAtual != estadoConfirmadoBotao
     ) {
-        estadoEstavelBotao = leitura;
+        estadoConfirmadoBotao = leituraAtual;
 
-        // Como usamos INPUT_PULLUP, LOW significa botao pressionado
-        if (estadoEstavelBotao == LOW) {
+        // Como usamos INPUT_PULLUP, LOW significa que o botao foi pressionado
+        if (estadoConfirmadoBotao == LOW) {
             alternarLimpadorPeloBotao();
         }
     }
 }
 
 
-// Le a umidade do DHT11 e decide se o modo automatico deve ligar ou desligar
+// Le a umidade do ar e aciona o limpador automaticamente se necessario
 void atualizarSensor() {
-    if (millis() - ultimaLeituraDht < INTERVALO_LEITURA_DHT) {
+    if (millis() - tempoUltimaLeituraDhtMs < INTERVALO_LEITURA_DHT_MS) {
         return;
     }
 
-    ultimaLeituraDht = millis();
+    tempoUltimaLeituraDhtMs = millis();
 
-    float umidade = dht.readHumidity();
+    float umidadeAtual = sensorDht.readHumidity();
 
-    if (isnan(umidade)) {
-        Serial.println("Falha ao ler o DHT11");
+    if (isnan(umidadeAtual)) {
+        Serial.println("Falha ao ler o sensor DHT11");
         return;
     }
 
     Serial.print("Umidade: ");
-    Serial.print(umidade, 1);
+    Serial.print(umidadeAtual, 1);
     Serial.println(" %");
 
-    if (umidade <= UMIDADE_PARA_DESLIGAR) {
-        ligadoPeloSensor = false;
+    if (umidadeAtual <= LIMIAR_UMIDADE_DESLIGAR) {
+        ativadoPorSensor = false;
         sensorAutomaticoBloqueado = false;
     } 
     else if (
-        umidade >= UMIDADE_PARA_LIGAR &&
+        umidadeAtual >= LIMIAR_UMIDADE_LIGAR &&
         !sensorAutomaticoBloqueado
     ) {
-        ligadoPeloSensor = true;
+        ativadoPorSensor = true;
     }
 
     atualizarEstadoLimpador("sensor");
 }
 
 
-// Faz o servo alternar continuamente entre esquerda e direita
+// Faz a palheta oscilar continuamente de um lado para o outro
 void atualizarServo() {
-    if (!ligado) {
+    if (!limpadorAtivo) {
         return;
     }
 
-    if (millis() - inicioDoCurso >= TEMPO_DO_CURSO) {
+    if (millis() - tempoInicioMovimentoMs >= TEMPO_CURSO_PALHETA_MS) {
 
-        destinoServo =
-            (destinoServo == ANGULO_DIREITA)
-                ? ANGULO_ESQUERDA
-                : ANGULO_DIREITA;
+        anguloDestinoServo =
+            (anguloDestinoServo == ANGULO_DIREITA_MAXIMO)
+                ? ANGULO_ESQUERDA_REPOUSO
+                : ANGULO_DIREITA_MAXIMO;
 
-        servo.write(destinoServo);
+        servoLimpador.write(anguloDestinoServo);
 
-        inicioDoCurso = millis();
+        tempoInicioMovimentoMs = millis();
     }
 }
 
 
-// Executado uma vez ao ligar o ESP32 e configura todos os componentes
+// Executado uma unica vez ao ligar o ESP32 para inicializar os perifericos
 void setup() {
     Serial.begin(115200);
 
-    pinMode(BOTAO, INPUT_PULLUP);
+    pinMode(PINO_BOTAO, INPUT_PULLUP);
 
-    servo.setPeriodHertz(50);
-    servo.attach(SERVO_PIN, 500, 2400);
-    servo.write(ANGULO_ESQUERDA);
+    servoLimpador.setPeriodHertz(50);
+    servoLimpador.attach(PINO_SERVO, 500, 2400);
+    servoLimpador.write(ANGULO_ESQUERDA_REPOUSO);
 
-    dht.begin();
+    sensorDht.begin();
 }
 
 
-// Executado continuamente e atualiza botao, sensor e servo
+// Loop principal que executa repetidamente as rotinas do sistema
 void loop() {
     atualizarBotao();
     atualizarSensor();
